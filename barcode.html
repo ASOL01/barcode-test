@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>バーコードスキャン 高精度版</title>
+<script src="https://unpkg.com/html5-qrcode"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #000; color: #fff; height: 100vh; display: flex; justify-content: center; overflow: hidden; }
+  
+  #app-container {
+    width: 100%; max-width: 800px; height: 100%;
+    display: flex; flex-direction: column; background: #111;
+  }
+
+  #header { padding: 15px; background: #1a1a1a; text-align: center; border-bottom: 1px solid #333; z-index: 20; }
+  #header h1 { font-size: 18px; font-weight: 700; color: #00e5ff; }
+
+  #camera-section {
+    position: relative; width: 100%; height: 60vh; /* iPad用に少し広めに確保 */
+    background: #000; overflow: hidden;
+    display: flex; justify-content: center; align-items: center;
+  }
+
+  /* ビデオにコントラストを少しつけてバーコードの線を強調 */
+  #reader video { 
+    width: 100% !important; 
+    height: 100% !important; 
+    object-fit: cover;
+    filter: contrast(1.1) brightness(1.1);
+  }
+
+  #reader { width: 100%; height: 100%; }
+  #qr-shaded-region { display: none !important; }
+
+  #snapshot {
+    position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+    object-fit: cover; display: none; z-index: 5;
+  }
+
+  /* スキャン枠の調整：大きめのバーコードに対応するため高さを160pxに拡張 */
+  #aim-frame {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    width: 85%; max-width: 500px; height: 160px; 
+    border: 3px solid #00e5ff; border-radius: 12px;
+    pointer-events: none; z-index: 10;
+    box-shadow: 0 0 0 4000px rgba(0,0,0,0.5), inset 0 0 15px rgba(0,229,255,0.3);
+    transition: all 0.3s ease;
+  }
+
+  #aim-frame.success {
+    border-color: #4caf50; background: rgba(76,175,80,0.2);
+    box-shadow: 0 0 0 4000px rgba(0,0,0,0.7), inset 0 0 20px rgba(76,175,80,0.5);
+  }
+
+  #scanline {
+    position: absolute; top: 0; left: 0; right: 0; height: 3px; background: #00e5ff;
+    animation: sc 2s linear infinite; box-shadow: 0 0 10px #00e5ff;
+  }
+
+  #aim-frame.success #scanline { display: none; }
+  @keyframes sc { 0% { top: 0%; } 100% { top: 100%; } }
+
+  #action-section {
+    flex: 1; padding: 25px; background: #111;
+    display: flex; flex-direction: column; align-items: center; justify-content: flex-start;
+  }
+
+  #status-msg { font-size: 16px; font-weight: bold; color: #00e5ff; margin-bottom: 20px; text-align: center; line-height: 1.4; }
+  
+  #result-ui { width: 100%; display: none; animation: fadeIn 0.3s; }
+  @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+
+  #einput {
+    width: 100%; font-size: 28px; font-family: 'Courier New', monospace; font-weight: bold; letter-spacing: 3px;
+    padding: 15px; border-radius: 12px; border: 2px solid #4caf50; background: #222; color: #fff;
+    text-align: center; margin-bottom: 25px; outline: none;
+  }
+
+  .btns { display: flex; gap: 15px; width: 100%; }
+  .btn { flex: 1; padding: 18px; border-radius: 12px; font-size: 18px; font-weight: bold; border: none; cursor: pointer; transition: opacity 0.2s; }
+  .btn:active { opacity: 0.7; }
+  .b-ok { background: #185FA5; color: #fff; }
+  .b-retry { background: #444; color: #fff; }
+
+  #close-btn-wrap { margin-top: auto; padding-top: 20px; width: 100%; }
+  .b-close { width: 100%; padding: 15px; border-radius: 12px; background: #1a1a1a; color: #888; border: 1px solid #333; font-weight: bold; cursor: pointer; }
+</style>
+</head>
+<body>
+
+<div id="app-container">
+  <div id="header">
+    <h1>📷 バーコードスキャン</h1>
+  </div>
+
+  <div id="camera-section">
+    <div id="reader"></div>
+    <img id="snapshot" alt="スキャン結果">
+    <div id="aim-frame">
+      <div id="scanline"></div>
+    </div>
+  </div>
+
+  <div id="action-section">
+    <div id="status-msg">カメラを起動中...</div>
+
+    <div id="result-ui">
+      <input type="tel" id="einput" maxlength="15" inputmode="numeric">
+      <div class="btns">
+        <button class="btn b-ok" onclick="doConfirm()">✅ 確定</button>
+        <button class="btn b-retry" onclick="doRetry()">🔄 再試行</button>
+      </div>
+    </div>
+
+    <div id="close-btn-wrap">
+      <button class="b-close" onclick="doClose()">キャンセルして閉じる</button>
+    </div>
+  </div>
+</div>
+
+<script>
+let scanner = null;
+let isScanning = true;
+
+async function startScanner() {
+  if (scanner) { try { await scanner.clear(); } catch(e) {} }
+  
+  scanner = new Html5Qrcode("reader");
+
+  const config = {
+    // iPadのCPU負荷を抑えつつ精度を出すため15fpsに設定
+    fps: 15, 
+    // スキャンエリアの設定
+    qrbox: (viewfinderWidth, viewfinderHeight) => {
+      const boxWidth = Math.min(viewfinderWidth * 0.85, 500);
+      const boxHeight = 160; // 大きなバーコードが入りやすい高さ
+      return { width: Math.floor(boxWidth), height: boxHeight };
+    },
+    // 高解像度（フルHD）を要求
+    videoConstraints: {
+      facingMode: "environment",
+      width: { ideal: 1920 },
+      height: { ideal: 1080 },
+      aspectRatio: { ideal: 1.7777777778 }
+    },
+    // iOS 17以降のNative Barcode Detector APIを優先利用
+    experimentalFeatures: { useBarCodeDetectorIfSupported: true },
+    formatsToSupport: [ 
+      Html5QrcodeSupportedFormats.CODE_128, 
+      Html5QrcodeSupportedFormats.ITF 
+    ]
+  };
+
+  try {
+    await scanner.start(
+      { facingMode: "environment" },
+      config,
+      (decodedText) => {
+        if (!isScanning) return;
+        
+        // 数字以外を除去
+        const cleanCode = decodedText.replace(/\D/g, '');
+        
+        // 15桁の場合のみ成功判定
+        if (cleanCode.length === 15) {
+          isScanning = false;
+          onSuccess(cleanCode);
+        }
+      },
+      () => { /* エラー時は何もしない（リトライを繰り返すため） */ }
+    );
+    document.getElementById('status-msg').innerHTML = "枠の中にバーコードを水平に映してください<br><small style='font-weight:normal; opacity:0.8;'>少し離すとピントが合いやすくなります</small>";
+  } catch (err) {
+    document.getElementById('status-msg').textContent = "カメラ起動エラー: " + err;
+    document.getElementById('status-msg').style.color = "#ff5252";
+  }
+}
+
+function onSuccess(digits) {
+  // 成功時のバイブレーション（iPadは非対応が多いがiPhone等で有効）
+  if (navigator.vibrate) navigator.vibrate(100);
+
+  // 成功時の静止画キャプチャ
+  try {
+    const videoEl = document.querySelector('#reader video');
+    if (videoEl) {
+      const canvas = document.createElement('canvas');
+      canvas.width = videoEl.videoWidth;
+      canvas.height = videoEl.videoHeight;
+      const ctx = canvas.getContext('2d');
+      // 少しコントラストをつけて保存
+      ctx.filter = 'contrast(1.1)';
+      ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
+      
+      const snapshotEl = document.getElementById('snapshot');
+      snapshotEl.src = canvas.toDataURL('image/jpeg', 0.8);
+      snapshotEl.style.display = 'block';
+    }
+  } catch(e) { console.error("Snapshot failed", e); }
+
+  if (scanner) scanner.pause(true);
+
+  // UI切り替え
+  document.getElementById('aim-frame').classList.add('success');
+  document.getElementById('status-msg').style.display = 'none';
+  document.getElementById('result-ui').style.display = 'block';
+  document.getElementById('einput').value = digits;
+}
+
+function doRetry() {
+  isScanning = true;
+  document.getElementById('snapshot').style.display = 'none';
+  document.getElementById('aim-frame').classList.remove('success');
+  document.getElementById('result-ui').style.display = 'none';
+  document.getElementById('status-msg').style.display = 'block';
+  document.getElementById('einput').value = '';
+  if (scanner) scanner.resume();
+}
+
+function doConfirm() {
+  const val = document.getElementById('einput').value;
+  const cleanVal = val.replace(/\D/g, '');
+
+  if (cleanVal.length !== 15) {
+    alert("バーコードは15桁の数字である必要があります。現在の入力: " + cleanVal.length + "桁");
+    return;
+  }
+
+  if (window.opener) {
+    window.opener.postMessage({ type: 'BARCODE_RESULT', barcode: cleanVal }, '*');
+    window.close();
+  } else {
+    alert('確定されたコード: ' + cleanVal);
+  }
+}
+
+function doClose() {
+  if (scanner) {
+    scanner.stop().then(() => {
+      window.close();
+    }).catch(() => {
+      window.close();
+    });
+  } else {
+    window.close();
+  }
+}
+
+// ページ読み込み時に開始
+window.onload = startScanner;
+</script>
+
+</body>
+</html>
